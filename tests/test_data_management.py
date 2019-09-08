@@ -4,7 +4,7 @@ import numpy as np
 import openmdao.api as om
 import pytest
 
-from openmdao_utils.data_management import case_dataset, pareto_subset
+from openmdao_omt.data_management import case_dataset, pareto_subset
 
 
 def nans(shape):

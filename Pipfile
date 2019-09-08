@@ -4,7 +4,7 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [dev-packages]
-openmdao-utils = {editable = true,path = "."}
+openmdao-omt = {editable = true,path = "."}
 black = "==19.3b0"
 flake8 = "*"
 pytest = "*"
