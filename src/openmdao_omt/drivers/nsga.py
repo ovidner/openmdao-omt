@@ -108,7 +108,7 @@ class GenericNsgaDriver(Driver):
             self.set_design_var(name, value)
 
         with RecordingDebugging(self._get_name(), self.iter_count, self):
-            self._problem.model.run_solve_nonlinear()
+            self._problem().model.run_solve_nonlinear()
 
         self.iter_count += 1
 
@@ -120,7 +120,7 @@ class GenericNsgaDriver(Driver):
             ),
             constraint_violation=constraint_violation(
                 values=self.get_constraint_values(),
-                meta=self._problem.model.get_constraints(),
+                meta=self._problem().model.get_constraints(),
             ),
         )
 

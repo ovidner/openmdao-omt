@@ -316,7 +316,7 @@ class DatasetRecorder(CaseRecorder):
 
         # grab the system
         if isinstance(recording_requester, Driver):
-            system = recording_requester._problem.model
+            system = recording_requester._problem().model
             driver = recording_requester
         elif isinstance(recording_requester, System):
             system = recording_requester
@@ -324,7 +324,7 @@ class DatasetRecorder(CaseRecorder):
             system = recording_requester.model
             driver = recording_requester.driver
         elif isinstance(recording_requester, Solver):
-            system = recording_requester._system
+            system = recording_requester._system()
         else:
             raise ValueError(
                 "Driver encountered a recording_requester it cannot handle"
@@ -430,7 +430,7 @@ class DatasetRecorder(CaseRecorder):
     def record_iteration_driver(self, recording_requester, data, metadata):
         timestamp = pd.Timestamp.fromtimestamp(metadata["timestamp"])
 
-        all_vars = dict(chain(data["in"].items(), data["out"].items()))
+        all_vars = dict(chain(data["input"].items(), data["output"].items()))
 
         def make_data_vars():
             for (name, value) in all_vars.items():
