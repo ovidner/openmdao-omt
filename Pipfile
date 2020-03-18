@@ -9,6 +9,9 @@ black = "==19.3b0"
 flake8 = "*"
 pytest = "*"
 hypothesis = "*"
+pdbpp = "*"
+pytest-profiling = "*"
+pymop = "*"
 
 [packages]
 

@@ -1,0 +1,367 @@
+import collections
+import dataclasses
+from copy import deepcopy
+from itertools import chain
+
+import deap
+import numpy as np
+from deap.base import Fitness
+
+from ..utils import VariableType
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectiveValueWithConstraintViolation:
+    objectives: tuple
+    constraint_violation: float
+
+    def __iter__(self):
+        yield from self.objectives
+
+
+class ConstraintDominatedFitness(Fitness):
+    feasibility_tolerance = 1e-12
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.constraint_violation = None
+
+    def __deepcopy__(self, memo):
+        # The base Fitness class uses an optimized deepcopy that throws away attributes
+        copy_ = super().__deepcopy__(memo)
+        copy_.constraint_violation = self.constraint_violation
+
+        return copy_
+
+    @property
+    def feasible(self):
+        return self.valid and self.constraint_violation <= self.feasibility_tolerance
+
+    def set_values(self, values):
+        if isinstance(values, ObjectiveValueWithConstraintViolation):
+            self.constraint_violation = values.constraint_violation
+            values = values.objectives
+        Fitness.setValues(self, values)
+
+    def del_values(self):
+        self.constraint_violation = None
+        Fitness.delValues(self)
+
+    values = property(Fitness.getValues, set_values, del_values)
+
+    def dominates(self, other, obj=slice(None)):
+        if self.feasible and other.feasible:
+            return super().dominates(other, obj)
+        else:
+            return self.constraint_violation < other.constraint_violation
+
+
+class Individual(list):
+    def __init__(self, *args, fitness_class, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fitness = fitness_class()
+
+    def __repr__(self):
+        return f"Individual({super().__repr__()})"
+
+
+@dataclasses.dataclass(frozen=True)
+class IndividualBounds:
+    lower: tuple
+    upper: tuple
+
+    @classmethod
+    def from_design_var_meta(cls, design_var_meta):
+        lower = {
+            name: (meta["lower"] if meta["type"].bounded else np.zeros(meta["shape"]))
+            for name, meta in design_var_meta.items()
+        }
+        upper = {
+            name: (
+                meta["upper"]
+                if meta["type"].bounded
+                else np.vectorize(len)(meta["values"]) - 1
+            )
+            for name, meta in design_var_meta.items()
+        }
+
+        return cls(
+            lower=tuple(individual_sequence(lower, design_var_meta)),
+            upper=tuple(individual_sequence(upper, design_var_meta)),
+        )
+
+
+def individual_sequence(design_vars, design_var_meta):
+    return chain.from_iterable(
+        np.broadcast_to(design_vars[name], meta["shape"]).flat
+        for name, meta in design_var_meta.items()
+    )
+
+
+def individual_types_sequence(design_var_meta):
+    return chain.from_iterable(
+        [meta["type"]] * np.product(meta["shape"] or (1,)) for meta in design_var_meta.values()
+    )
+
+
+def stretch_array(array, shape):
+    try:
+        return np.broadcast_to(array, shape)
+    except ValueError:
+        return np.reshape(array, shape)
+
+    missing_dims = len(shape) - array.ndim
+    indexer = (...,) + (np.newaxis,) * missing_dims
+
+    array = array[indexer]
+
+    return np.broadcast_to(array, shape)
+
+
+def random_ints(shape, lower, upper):
+    ret = np.empty(shape, dtype=np.int)
+
+    lower = np.broadcast_to(lower, shape)
+    upper = np.broadcast_to(upper, shape)
+
+    for i in np.ndindex(*shape):
+        ret[i] = np.random.randint(lower[i], upper[i], dtype=np.int)
+
+    return ret
+
+
+def random_floats(shape, lower, upper):
+    ret = np.empty(shape)
+
+    lower = stretch_array(lower, shape)
+    upper = stretch_array(upper, shape)
+
+    for i in np.ndindex(*shape):
+        ret[i] = np.random.rand() * (upper[i] - lower[i]) + lower[i]
+
+    return ret
+
+
+def random_choice(shape: tuple, values: set):
+    ret = np.empty(shape, dtype=object)
+
+    values = np.broadcast_to(values, shape)
+
+    for i in np.ndindex(*shape):
+        ret[i] = np.random.choice(list(values[i]))
+
+    return ret
+
+
+def convert_design_vars_to_individual(design_var_meta, fitness_class, design_vars):
+    """
+    Converts a dict of OpenMDAO design variables into a DEAP individual.
+    """
+    return Individual(
+        individual_sequence(design_vars, design_var_meta), fitness_class=fitness_class
+    )
+
+
+def convert_individual_to_design_vars(
+    individual, design_var_meta, discrete_value_mappings
+):
+    """
+    Converts a DEAP individual into a dict of OpenMDAO design variables.
+    """
+    ind = deepcopy(individual)
+
+    design_vars = {}
+    for name, meta in design_var_meta.items():
+        shape = meta["shape"]
+        type_ = meta["type"]
+        ind_items = np.prod(shape, dtype=int)
+        values = np.array(
+            ind[:ind_items],
+            dtype=(np.float if type_ is VariableType.CONTINUOUS else np.int),
+        ).reshape(shape)
+
+        if type_.discrete and not type_.bounded:
+            values = values.astype("O")
+            for arr_index, index in np.ndenumerate(values):
+                a = discrete_value_mappings[name][arr_index][index]
+                values[arr_index] = a
+        design_vars[name] = values
+        ind = ind[ind_items:]
+    return design_vars
+
+
+def random_individual_value(type_, lower, upper):
+    if type_ is VariableType.CONTINUOUS:
+        return np.random.rand() * (upper - lower) + lower
+    else:
+        return np.random.randint(lower, upper + 1)
+
+
+def init_population(count, individual_types, individual_bounds, fitness_class):
+    for i in range(count):
+        yield Individual(
+            [
+                random_individual_value(type_, lower, upper)
+                for (type_, lower, upper) in zip(
+                    individual_types, individual_bounds.lower, individual_bounds.upper
+                )
+            ],
+            fitness_class=fitness_class,
+        )
+
+
+def disassemble_individuals(types, individuals):
+    for ind in individuals:
+        yield {
+            type_: [attr for attr, attr_type in zip(ind, types) if attr_type is type_]
+            for type_ in VariableType
+        }
+
+
+def types_index(types):
+    counter = collections.Counter()
+    for type_ in types:
+        yield counter[type_]
+        counter[type_] += 1
+
+
+def reassemble_individuals(types, individual_pairs):
+    for (index, (type_, sub_index)) in enumerate(zip(types, types_index(types))):
+        for ind, targ_ind in individual_pairs:
+            targ_ind[index] = ind[type_][sub_index]
+
+
+def mate_disassembled(
+    ind1,
+    ind2,
+    individual_types,
+    individual_bounds,
+    cont_eta=30,
+    int_indpb=1.0,
+    ord_indpb=1.0,
+    nom_indpb=1.0,
+):
+    (da_ind1, da_ind2, da_lower, da_upper) = disassemble_individuals(
+        individual_types, (ind1, ind2, individual_bounds.lower, individual_bounds.upper)
+    )
+
+    deap.tools.cxSimulatedBinaryBounded(
+        da_ind1[VariableType.CONTINUOUS],
+        da_ind2[VariableType.CONTINUOUS],
+        eta=cont_eta,
+        low=da_lower[VariableType.CONTINUOUS],
+        up=da_upper[VariableType.CONTINUOUS],
+    )
+    deap.tools.cxUniform(
+        da_ind1[VariableType.INTEGER], da_ind2[VariableType.INTEGER], indpb=int_indpb
+    )
+    deap.tools.cxUniform(
+        da_ind1[VariableType.ORDINAL], da_ind2[VariableType.ORDINAL], indpb=ord_indpb
+    )
+    deap.tools.cxUniform(
+        da_ind1[VariableType.NOMINAL], da_ind2[VariableType.NOMINAL], indpb=nom_indpb
+    )
+
+    reassemble_individuals(individual_types, [(da_ind1, ind1), (da_ind2, ind2)])
+
+    return ind1, ind2
+
+
+def mutate_disassembled(
+    ind,
+    individual_types,
+    individual_bounds,
+    cont_eta=20,
+    cont_indpb=1.0,
+    int_indpb=1.0,
+    ord_indpb=1.0,
+    nom_indpb=1.0,
+):
+    (da_ind, da_lower, da_upper) = disassemble_individuals(
+        individual_types, (ind, individual_bounds.lower, individual_bounds.upper)
+    )
+
+    deap.tools.mutPolynomialBounded(
+        da_ind[VariableType.CONTINUOUS],
+        eta=cont_eta,
+        indpb=cont_indpb,
+        low=da_lower[VariableType.CONTINUOUS],
+        up=da_upper[VariableType.CONTINUOUS],
+    )
+
+    deap.tools.mutUniformInt(
+        da_ind[VariableType.INTEGER],
+        indpb=int_indpb,
+        low=da_lower[VariableType.INTEGER],
+        up=da_upper[VariableType.INTEGER],
+    )
+
+    deap.tools.mutUniformInt(
+        da_ind[VariableType.ORDINAL],
+        indpb=ord_indpb,
+        low=da_lower[VariableType.ORDINAL],
+        up=da_upper[VariableType.ORDINAL],
+    )
+
+    deap.tools.mutUniformInt(
+        da_ind[VariableType.NOMINAL],
+        indpb=nom_indpb,
+        low=da_lower[VariableType.NOMINAL],
+        up=da_upper[VariableType.NOMINAL],
+    )
+
+    reassemble_individuals(individual_types, [(da_ind, ind)])
+
+    return (ind,)
+
+
+def _make_discrete_value_mapping(values_set, type_):
+    if type_.ordered:
+        values_set = sorted(values_set)
+    enum_values = enumerate(values_set)
+    return {index: value for index, value in enum_values}
+
+
+def make_discrete_value_mappings(design_var_meta):
+    for name, meta in design_var_meta.items():
+        type_ = meta["type"]
+        if type_.bounded:
+            continue
+
+        yield name, np.vectorize(lambda x: _make_discrete_value_mapping(x, type_))(
+            meta["values"]
+        )
+
+
+def epsilonify(value, eps=np.finfo(float).eps):
+    value = np.copy(value)
+    if isinstance(value, np.ndarray):
+        value[value == 0.0] = eps
+    else:
+        value = value or eps
+    return value
+
+
+def constraint_violation(values, meta):
+    keys = set(values.keys())
+    assert keys == set(meta.keys())
+
+    total_violation = 0.0
+    for key in keys:
+        var_meta = meta[key]
+        val = values[key]
+
+        lower = var_meta["lower"]
+        lower_eps = epsilonify(lower)
+        upper = var_meta["upper"]
+        upper_eps = epsilonify(upper)
+        equals = var_meta["equals"]
+        equals_eps = epsilonify(equals)
+
+        total_violation += np.sum(np.abs(np.fmax(upper, val) / upper_eps - 1))
+        total_violation += np.sum(np.abs(np.fmin(lower, val) / lower_eps - 1))
+        if equals is not None:
+            total_violation += np.sum(np.abs(val / equals_eps - 1))
+
+    assert total_violation >= 0.0
+    return total_violation

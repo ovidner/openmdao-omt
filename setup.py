@@ -8,5 +8,5 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     python_requires=">=3.7, <4",
-    install_requires=["openmdao", "psutil", "pandas", "xarray"],
+    install_requires=["openmdao", "deap", "psutil", "pandas", "xarray"],
 )
