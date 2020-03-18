@@ -309,7 +309,7 @@ class DatasetRecorder(CaseRecorder):
     def startup(self, recording_requester):
         super().startup(recording_requester)
         # ds = xr.Dataset(data_vars={"counter": xr.DataArray(), "timestamp": xr.DataArray()}, coords={"name": xr.DataArray()})
-        self.datasets[recording_requester] = None
+        self.datasets[recording_requester] = []
 
         ##### START SHAMELESS COPY FROM SqliteRecorder #####
         driver = None
@@ -460,12 +460,8 @@ class DatasetRecorder(CaseRecorder):
             },
             coords={DESIGN_ID: np.array([self._iteration_coordinate], dtype=str),},
         )
-        if self.datasets[recording_requester]:
-            self.datasets[recording_requester] = xr.concat(
-                [self.datasets[recording_requester], ds], dim=DESIGN_ID,
-            )
-        else:
-            self.datasets[recording_requester] = ds
+
+        self.datasets[recording_requester].append(ds)
 
     def record_iteration_problem(self, recording_requester, data, metadata):
         raise NotImplementedError(
@@ -495,3 +491,6 @@ class DatasetRecorder(CaseRecorder):
 
     def record_viewer_data(self, model_viewer_data):
         pass
+
+    def assemble_dataset(self, recording_requester):
+        return xr.concat(self.datasets[recording_requester], dim=DESIGN_ID).squeeze()
