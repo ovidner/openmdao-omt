@@ -5,4 +5,5 @@ from .data_management import (
     pareto_subset,
 )
 from .drivers.nsga import Nsga2Driver, Nsga3Driver
+from .solvers import DiscreteBroydenSolver
 from .utils import VariableType, add_design_var
