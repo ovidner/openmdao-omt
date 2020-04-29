@@ -265,6 +265,9 @@ def constraint_violations(ds):
 
 
 def wrapper_array(inp):
+    if isinstance(inp, np.ndarray) and np.ndim(inp) == 0:
+        inp = inp.item()
+
     a = np.empty((1,), dtype="O")
     a[0] = inp
     return a
@@ -435,12 +438,12 @@ class DatasetRecorder(CaseRecorder):
         def make_data_vars():
             for (name, value) in all_vars.items():
                 meta = self._abs2meta[name]
-                if meta["discrete"]:
-                    val = wrapper_array(value)
-                    shape = tuple()
-                else:
+                if isinstance(value, (int, float, bool, np.ndarray)):
                     val = np.asarray([value])
                     shape = val.shape
+                else:
+                    val = wrapper_array(value)
+                    shape = tuple()
                 dims = (DESIGN_ID, *(f"{name}_{dim}" for dim in range(len(shape) - 1)))
                 yield (name, (dims, val, meta))
 
