@@ -151,6 +151,48 @@ class GenericNsgaDriver(Driver):
 
         return False
 
+    def set_design_var(self, name, value):
+        # Patched version of the method from openmdao.core.driver.Driver,
+        # supporting non-int discrete variables
+        """
+        Set the value of a design variable.
+
+        Parameters
+        ----------
+        name : str
+            Global pathname of the design variable.
+        value : float or ndarray
+            Value for the design variable.
+        """
+        problem = self._problem()
+
+        # if the value is not local, don't set the value
+        if (name in self._remote_dvs and
+                problem.model._owning_rank[name] != problem.comm.rank):
+            return
+
+        meta = self._designvars[name]
+        indices = meta['indices']
+        if indices is None:
+            indices = slice(None)
+
+        if name in self._designvars_discrete:
+            problem.model._discrete_outputs[name] = value
+
+        else:
+            desvar = problem.model._outputs._views_flat[name]
+            desvar[indices] = value
+
+            # Undo driver scaling when setting design var values into model.
+            if self._has_scaling:
+                scaler = meta['scaler']
+                if scaler is not None:
+                    desvar[indices] *= 1.0 / scaler
+
+                adder = meta['adder']
+                if adder is not None:
+                    desvar[indices] -= adder
+
 
 class Nsga2Driver(GenericNsgaDriver):
     def _get_name(self):
