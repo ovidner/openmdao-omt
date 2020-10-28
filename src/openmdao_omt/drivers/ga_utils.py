@@ -61,6 +61,9 @@ class Individual(list):
         super().__init__(*args, **kwargs)
         self.fitness = fitness_class()
 
+        # Metadata
+        self.generation = None
+
     def __repr__(self):
         return f"Individual({super().__repr__()})"
 
@@ -100,7 +103,8 @@ def individual_sequence(design_vars, design_var_meta):
 
 def individual_types_sequence(design_var_meta):
     return chain.from_iterable(
-        [meta["type"]] * np.product(meta["shape"] or (1,)) for meta in design_var_meta.values()
+        [meta["type"]] * np.product(meta["shape"] or (1,))
+        for meta in design_var_meta.values()
     )
 
 
@@ -185,8 +189,10 @@ def convert_individual_to_design_vars(
             for arr_index, index in np.ndenumerate(values):
                 a = discrete_value_mappings[name][arr_index][index]
                 values[arr_index] = a
+        assert values.shape == shape
         design_vars[name] = values
         ind = ind[ind_items:]
+
     return design_vars
 
 
@@ -237,7 +243,7 @@ def mate_disassembled(
     individual_types,
     individual_bounds,
     cont_eta=30,
-    int_indpb=1.0,
+    int_eta=30,
     ord_indpb=1.0,
     nom_indpb=1.0,
 ):
@@ -252,12 +258,21 @@ def mate_disassembled(
         low=da_lower[VariableType.CONTINUOUS],
         up=da_upper[VariableType.CONTINUOUS],
     )
-    deap.tools.cxUniform(
-        da_ind1[VariableType.INTEGER], da_ind2[VariableType.INTEGER], indpb=int_indpb
+
+    deap.tools.cxSimulatedBinaryBounded(
+        da_ind1[VariableType.INTEGER],
+        da_ind2[VariableType.INTEGER],
+        eta=int_eta,
+        low=da_lower[VariableType.INTEGER],
+        up=da_upper[VariableType.INTEGER],
     )
+    da_ind1[VariableType.INTEGER] = np.round(da_ind1[VariableType.INTEGER]).tolist()
+    da_ind2[VariableType.INTEGER] = np.round(da_ind2[VariableType.INTEGER]).tolist()
+
     deap.tools.cxUniform(
         da_ind1[VariableType.ORDINAL], da_ind2[VariableType.ORDINAL], indpb=ord_indpb
     )
+
     deap.tools.cxUniform(
         da_ind1[VariableType.NOMINAL], da_ind2[VariableType.NOMINAL], indpb=nom_indpb
     )
@@ -273,6 +288,7 @@ def mutate_disassembled(
     individual_bounds,
     cont_eta=20,
     cont_indpb=1.0,
+    int_eta=20,
     int_indpb=1.0,
     ord_indpb=1.0,
     nom_indpb=1.0,
@@ -289,12 +305,14 @@ def mutate_disassembled(
         up=da_upper[VariableType.CONTINUOUS],
     )
 
-    deap.tools.mutUniformInt(
+    deap.tools.mutPolynomialBounded(
         da_ind[VariableType.INTEGER],
+        eta=int_eta,
         indpb=int_indpb,
         low=da_lower[VariableType.INTEGER],
         up=da_upper[VariableType.INTEGER],
     )
+    da_ind[VariableType.INTEGER] = np.round(da_ind[VariableType.INTEGER]).tolist()
 
     deap.tools.mutUniformInt(
         da_ind[VariableType.ORDINAL],

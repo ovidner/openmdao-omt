@@ -5,6 +5,7 @@ from itertools import chain
 
 import numpy as np
 import pandas as pd
+import pygmo
 import xarray as xr
 from openmdao.core.driver import Driver
 from openmdao.core.problem import Problem
@@ -12,7 +13,7 @@ from openmdao.core.system import System
 from openmdao.recorders.case_recorder import CaseRecorder
 from openmdao.solvers.solver import Solver
 
-DESIGN_ID = "id"
+DESIGN_ID = "design"
 
 
 def merge_dicts(dicts):
@@ -159,27 +160,42 @@ def case_dataset(case_reader, use_promoted_name=True):
     return ds
 
 
+def design_space(ds):
+    return ds.filter_by_attrs(type=lambda x: x and "desvar" in x)
+
+
+def objective_space(ds, scale=False):
+    objectives = ds.filter_by_attrs(type=lambda x: x and "objective" in x)
+    if not scale:
+        return objectives
+
+    scaler_ds = xr.Dataset(
+        {
+            name: var.attrs["type"]["objective"]["scaler"] or 1.0
+            for (name, var) in objectives.items()
+        }
+    )
+    adder_ds = xr.Dataset(
+        {
+            name: var.attrs["type"]["objective"]["adder"] or 0.0
+            for (name, var) in objectives.items()
+        }
+    )
+
+    return objectives * scaler_ds + adder_ds
+
+
+def constraint_space(ds):
+    return ds.filter_by_attrs(type=lambda x: x and "constraint" in x)
+
+
 def pareto_subset(ds):
     # objectives = ds.filter_by_attrs(role=VariableRole.OBJECTIVE)
     if len(ds[DESIGN_ID]) < 1:
         raise ValueError("Supplied dataset has no designs.")
-    objectives = ds.filter_by_attrs(type=lambda x: x and "objective" in x)
-    scaling_array = np.array(
-        [
-            # (o.attrs["scaling"].multiplier, o.attrs["scaling"].offset)
-            (
-                o.attrs["type"]["objective"]["scaler"] or 1.0,
-                o.attrs["type"]["objective"]["adder"] or 0.0,
-            )
-            for o in objectives.values()
-        ]
-    )
-    stacked_objectives = objectives.to_stacked_array("objectives", [DESIGN_ID]).astype(
-        float
-    )
-    scaled_objectives = stacked_objectives * scaling_array[:, 0] + scaling_array[:, 1]
+    scaled_objectives = objective_space(ds, scale=True).to_array()
     pareto_mask = xr.DataArray(
-        is_pareto_efficient(scaled_objectives.values), dims=[DESIGN_ID]
+        is_pareto_efficient(scaled_objectives.T.values), dims=[DESIGN_ID]
     )
 
     return ds.where(pareto_mask, drop=True)
@@ -187,11 +203,12 @@ def pareto_subset(ds):
 
 def feasible_subset(ds):
     # objectives = ds.filter_by_attrs(role=VariableRole.OBJECTIVE)
-    eq_constraints = ds.filter_by_attrs(
-        type=lambda x: x and "constraint" in x and x["constraint"]["equals"] is not None
+    constraints = constraint_space(ds)
+    eq_constraints = constraints.filter_by_attrs(
+        type=lambda x: x and x["constraint"]["equals"] is not None
     )
-    ineq_constraints = ds.filter_by_attrs(
-        type=lambda x: x and "constraint" in x and x["constraint"]["equals"] is None
+    ineq_constraints = constraints.filter_by_attrs(
+        type=lambda x: x and x["constraint"]["equals"] is None
     )
 
     lower_bound_ds = xr.Dataset(
@@ -223,6 +240,28 @@ def epsilonify(da: xr.DataArray, eps=np.finfo(float).eps) -> xr.DataArray:
     da = da.copy()
     da[da.isin([0.0])] = eps
     return da
+
+
+def hv_ref_point(ds, offset_ratio=0.001):
+    scaled_objectives = objective_space(ds, scale=True)
+
+    nadir_point = scaled_objectives.max()
+    ref_point = nadir_point + abs(nadir_point) * offset_ratio
+
+    return ref_point.to_array()
+
+
+def hypervolume(ds, ref_point=None):
+    scaled_objectives = objective_space(ds, scale=True)
+
+    hv = pygmo.hypervolume(scaled_objectives.to_array().T)
+
+    if ref_point is None:
+        ref_point = hv.refpoint()
+
+    return xr.DataArray(
+        hv.compute(ref_point), name="hypervolume", attrs={"units": None}
+    )
 
 
 def constraint_violations(ds):
@@ -279,22 +318,129 @@ def annotate_ds_with_constraint_violations(ds):
 
 
 def annotate_ds_with_rank(ds):
-    objectives = ds.filter_by_attrs(type=lambda x: x and "objective" in x)
-    scaler_da = xr.Dataset({
-        name: var.attrs["type"]["objective"]["scaler"] or 1.0
-        for (name, var) in objectives.items()
-    }).to_array()
-    adder_da = xr.Dataset({
-        name: var.attrs["type"]["objective"]["adder"] or 0.0
-        for (name, var) in objectives.items()
-    }).to_array()
-
-    scaled_objectives = objectives.to_array() * scaler_da + adder_da
+    scaled_objectives = objective_space(ds, scale=True).to_array()
 
     ranks = xr.DataArray(
-        constraint_dominated_ranks(scaled_objectives.T.values, ds["constraint_violation"].values), dims=[DESIGN_ID]
+        constraint_dominated_ranks(
+            scaled_objectives.T.values, ds["constraint_violation"].values
+        ),
+        dims=[DESIGN_ID],
     )
     return ds.merge({"rank": ranks})
+
+
+def generate_abs2meta(recording_requester):
+    meta = {}
+    ##### START ADAPTATION FROM SqliteRecorder #####
+    driver = None
+
+    # grab the system
+    if isinstance(recording_requester, Driver):
+        system = recording_requester._problem().model
+        driver = recording_requester
+    elif isinstance(recording_requester, System):
+        system = recording_requester
+    elif isinstance(recording_requester, Problem):
+        system = recording_requester.model
+        driver = recording_requester.driver
+    elif isinstance(recording_requester, Solver):
+        system = recording_requester._system()
+    else:
+        raise ValueError(
+            "Driver encountered a recording_requester it cannot handle"
+            ": {0}".format(recording_requester)
+        )
+
+    states = system._list_states_allprocs()
+
+    if driver is None:
+        desvars = system.get_design_vars(True, get_sizes=False)
+        responses = system.get_responses(True, get_sizes=False)
+        objectives = OrderedDict()
+        constraints = OrderedDict()
+        for name, data in responses.items():
+            if data["type"] == "con":
+                constraints[name] = data
+            else:
+                objectives[name] = data
+    else:
+        desvars = driver._designvars
+        constraints = driver._cons
+        objectives = driver._objs
+        responses = driver._responses
+
+    inputs = (
+        system._var_allprocs_abs_names["input"]
+        + system._var_allprocs_abs_names_discrete["input"]
+    )
+
+    outputs = (
+        system._var_allprocs_abs_names["output"]
+        + system._var_allprocs_abs_names_discrete["output"]
+    )
+
+    full_var_set = [
+        (outputs, "output"),
+        (desvars, "desvar"),
+        (responses, "response"),
+        (objectives, "objective"),
+        (constraints, "constraint"),
+    ]
+
+    # # merge current abs2prom and prom2abs with this system's version
+    # self._abs2prom["input"].update(system._var_abs2prom["input"])
+    # self._abs2prom["output"].update(system._var_abs2prom["output"])
+    # for v, abs_names in system._var_allprocs_prom2abs_list["input"].items():
+    #     if v not in self._prom2abs["input"]:
+    #         self._prom2abs["input"][v] = abs_names
+    #     else:
+    #         self._prom2abs["input"][v] = list(
+    #             set(chain(self._prom2abs["input"][v], abs_names))
+    #         )
+
+    # # for outputs, there can be only one abs name per promoted name
+    # for v, abs_names in system._var_allprocs_prom2abs_list["output"].items():
+    #     self._prom2abs["output"][v] = abs_names
+
+    # absolute pathname to metadata mappings for continuous & discrete variables
+    # discrete mapping is sub-keyed on 'output' & 'input'
+    real_meta = system._var_allprocs_abs2meta
+    disc_meta = system._var_allprocs_discrete
+
+    for var_set, var_type in full_var_set:
+        for name in var_set:
+            if name not in meta:
+                try:
+                    meta[name] = real_meta[name].copy()
+                    meta[name]["discrete"] = False
+                except KeyError:
+                    meta[name] = disc_meta["output"][name].copy()
+                    meta[name]["discrete"] = True
+                meta[name]["type"] = {}
+                meta[name]["explicit"] = name not in states
+                # self._abs2meta[name]["tags"] = list(self._abs2meta[name].get("tags", []))
+
+            if var_type not in meta[name]["type"]:
+                try:
+                    var_type_meta = var_set[name]
+                except TypeError:
+                    var_type_meta = {}
+                meta[name]["type"][var_type] = var_type_meta
+
+    for name in inputs:
+        try:
+            meta[name] = real_meta[name].copy()
+            meta[name]["discrete"] = False
+        except KeyError:
+            meta[name] = disc_meta["input"][name].copy()
+            meta[name]["discrete"] = True
+        meta[name]["type"] = {"input": {}}
+        meta[name]["explicit"] = True
+        # self._abs2meta[name]["tags"] = list(self._abs2meta[name].get("tags", []))
+
+    ##### END ADAPTATION FROM SqliteRecorder #####
+
+    return meta
 
 
 class DatasetRecorder(CaseRecorder):
@@ -305,8 +451,8 @@ class DatasetRecorder(CaseRecorder):
             )
         super().__init__(record_viewer_data=record_viewer_data)
         self.datasets = {}
-        self._abs2prom = {"input": {}, "output": {}}
-        self._prom2abs = {"input": {}, "output": {}}
+        # self._abs2prom = {"input": {}, "output": {}}
+        # self._prom2abs = {"input": {}, "output": {}}
         self._abs2meta = {}
 
     def startup(self, recording_requester):
@@ -314,154 +460,55 @@ class DatasetRecorder(CaseRecorder):
         # ds = xr.Dataset(data_vars={"counter": xr.DataArray(), "timestamp": xr.DataArray()}, coords={"name": xr.DataArray()})
         self.datasets[recording_requester] = []
 
-        ##### START SHAMELESS COPY FROM SqliteRecorder #####
-        driver = None
-
-        # grab the system
-        if isinstance(recording_requester, Driver):
-            system = recording_requester._problem().model
-            driver = recording_requester
-        elif isinstance(recording_requester, System):
-            system = recording_requester
-        elif isinstance(recording_requester, Problem):
-            system = recording_requester.model
-            driver = recording_requester.driver
-        elif isinstance(recording_requester, Solver):
-            system = recording_requester._system()
-        else:
-            raise ValueError(
-                "Driver encountered a recording_requester it cannot handle"
-                ": {0}".format(recording_requester)
-            )
-
-        states = system._list_states_allprocs()
-
-        if driver is None:
-            desvars = system.get_design_vars(True, get_sizes=False)
-            responses = system.get_responses(True, get_sizes=False)
-            objectives = OrderedDict()
-            constraints = OrderedDict()
-            for name, data in responses.items():
-                if data["type"] == "con":
-                    constraints[name] = data
-                else:
-                    objectives[name] = data
-        else:
-            desvars = driver._designvars
-            constraints = driver._cons
-            objectives = driver._objs
-            responses = driver._responses
-
-        inputs = (
-            system._var_allprocs_abs_names["input"]
-            + system._var_allprocs_abs_names_discrete["input"]
-        )
-
-        outputs = (
-            system._var_allprocs_abs_names["output"]
-            + system._var_allprocs_abs_names_discrete["output"]
-        )
-
-        full_var_set = [
-            (outputs, "output"),
-            (desvars, "desvar"),
-            (responses, "response"),
-            (objectives, "objective"),
-            (constraints, "constraint"),
-        ]
-
-        # merge current abs2prom and prom2abs with this system's version
-        self._abs2prom["input"].update(system._var_abs2prom["input"])
-        self._abs2prom["output"].update(system._var_abs2prom["output"])
-        for v, abs_names in system._var_allprocs_prom2abs_list["input"].items():
-            if v not in self._prom2abs["input"]:
-                self._prom2abs["input"][v] = abs_names
-            else:
-                self._prom2abs["input"][v] = list(
-                    set(chain(self._prom2abs["input"][v], abs_names))
-                )
-
-        # for outputs, there can be only one abs name per promoted name
-        for v, abs_names in system._var_allprocs_prom2abs_list["output"].items():
-            self._prom2abs["output"][v] = abs_names
-
-        # absolute pathname to metadata mappings for continuous & discrete variables
-        # discrete mapping is sub-keyed on 'output' & 'input'
-        real_meta = system._var_allprocs_abs2meta
-        disc_meta = system._var_allprocs_discrete
-
-        for var_set, var_type in full_var_set:
-            for name in var_set:
-                if name not in self._abs2meta:
-                    try:
-                        self._abs2meta[name] = real_meta[name].copy()
-                        self._abs2meta[name]["discrete"] = False
-                    except KeyError:
-                        self._abs2meta[name] = disc_meta["output"][name].copy()
-                        self._abs2meta[name]["discrete"] = True
-                    self._abs2meta[name]["type"] = {}
-                    self._abs2meta[name]["explicit"] = name not in states
-                    # self._abs2meta[name]["tags"] = list(self._abs2meta[name].get("tags", []))
-
-                if var_type not in self._abs2meta[name]["type"]:
-                    try:
-                        var_type_meta = var_set[name]
-                    except TypeError:
-                        var_type_meta = {}
-                    self._abs2meta[name]["type"][var_type] = var_type_meta
-
-        for name in inputs:
-            try:
-                self._abs2meta[name] = real_meta[name].copy()
-                self._abs2meta[name]["discrete"] = False
-            except KeyError:
-                self._abs2meta[name] = disc_meta["input"][name].copy()
-                self._abs2meta[name]["discrete"] = True
-            self._abs2meta[name]["type"] = {"input": {}}
-            self._abs2meta[name]["explicit"] = True
-            # self._abs2meta[name]["tags"] = list(self._abs2meta[name].get("tags", []))
-
-        ##### END SHAMELESS COPY FROM SqliteRecorder #####
-
-    def variable_meta(self, name):
-        meta = self._abs2meta[name]
-        return {
-            "units": meta.get("units", None),
-            "roles": meta["type"],
-        }
+        self._abs2meta.update(generate_abs2meta(recording_requester))
 
     def record_iteration_driver(self, recording_requester, data, metadata):
         timestamp = pd.Timestamp.fromtimestamp(metadata["timestamp"])
 
         all_vars = dict(chain(data["input"].items(), data["output"].items()))
 
+        # hvplot borks of MultiIndex :((
+        # design_idx = pd.MultiIndex.from_tuples(
+        #     [(metadata["name"], 0, self._counter - 1, self._iteration_coordinate)],
+        #     names=("driver", "rank", "counter", "name"),
+        # )
+        design_idx = [self._iteration_coordinate]
+
         def make_data_vars():
             for (name, value) in all_vars.items():
                 meta = self._abs2meta[name]
-                if isinstance(value, (int, float, bool, np.ndarray)):
-                    val = np.asarray([value])
-                    shape = val.shape
-                else:
-                    val = wrapper_array(value)
-                    shape = tuple()
-                dims = (DESIGN_ID, *(f"{name}_{dim}" for dim in range(len(shape) - 1)))
-                yield (name, (dims, val, meta))
+                val = np.atleast_1d(value).copy()
+                extra_dims = []
+                if val.size > 1:
+                    idx = pd.MultiIndex.from_tuples(np.ndindex(val.shape))
+                    extra_dims = [(f"{name}_dim", idx)]
+                    val = val.reshape((1, -1))
 
+                yield (
+                    name,
+                    xr.DataArray(
+                        data=val,
+                        name=name,
+                        attrs=meta,
+                        coords=[(DESIGN_ID, design_idx), *extra_dims],
+                    ),
+                )
+
+        meta_vars = {
+            key: xr.DataArray([item], dims=[DESIGN_ID])
+            for (key, item) in metadata.items()
+            if key not in ["name", "success", "timestamp", "msg"]
+        }
         data_vars = dict(make_data_vars())
 
         ds = xr.Dataset(
             data_vars={
-                # "counter": (DESIGN_ID, np.array([self._counter], dtype=int)),
-                "timestamp": (DESIGN_ID, np.array([timestamp])),
-                "msg": (DESIGN_ID, np.array([metadata["msg"]], dtype=str)),
-                "name": (DESIGN_ID, np.array([metadata["name"]], dtype=str)),
-                "success": (
-                    DESIGN_ID,
-                    np.array([bool(metadata["success"])], dtype=bool),
-                ),
+                "timestamp": xr.DataArray([timestamp], dims=[DESIGN_ID]),
+                "success": xr.DataArray([bool(metadata["success"])], dims=[DESIGN_ID]),
+                "msg": xr.DataArray([metadata["msg"]], dims=[DESIGN_ID]),
+                **meta_vars,
                 **data_vars,
             },
-            coords={DESIGN_ID: np.array([self._iteration_coordinate], dtype=str),},
         )
 
         self.datasets[recording_requester].append(ds)

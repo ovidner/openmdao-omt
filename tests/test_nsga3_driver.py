@@ -9,12 +9,14 @@ import hypothesis.extra.numpy as np_st
 import hypothesis.strategies as st
 import numpy as np
 import openmdao.api as om
-import pymop
 import pytest
 import scipy as sp
 from deap.tools import uniform_reference_points
 
+import pymop
 from openmdao_omt import (
+    DatasetRecorder,
+    Nsga2Driver,
     Nsga3Driver,
     VariableType,
     add_design_var,
@@ -39,7 +41,7 @@ var_type_st = st.sampled_from(VariableType)
 @st.composite
 def variable_st(draw):
     type_ = draw(var_type_st)
-    shape = draw(np_st.array_shapes())
+    shape = draw(np_st.array_shapes(min_dims=0))
 
     if type_.bounded:
         dtype, dtype_st, eps = (
@@ -83,7 +85,7 @@ def variable_st(draw):
     return {"type": type_, "shape": shape, **output}
 
 
-# @hypothesis.reproduce_failure("4.36.1", b"AXicY2RkYGAEYiQAAABVAAU=")
+# @hypothesis.reproduce_failure("5.6.0", b"AXicY2RkYGBkBBIIAAAAYgAG")
 @hypothesis.settings(deadline=10000, max_examples=20, print_blob=True)
 @hypothesis.given(
     variables=st.lists(
@@ -93,7 +95,7 @@ def variable_st(draw):
         unique_by=lambda x: x[0],
     )
 )
-def test_variable_mixing(recording_path, variables):
+def test_variable_mixing(variables):
     prob = om.Problem()
 
     for name, var in variables:
@@ -102,18 +104,20 @@ def test_variable_mixing(recording_path, variables):
         if var["type"] is VariableType.CONTINUOUS:
             indeps.add_output("x", shape=var["shape"])
         else:
-            indeps.add_discrete_output("x", None, shape=var["shape"])
+            indeps.add_discrete_output("x", None)
 
         add_design_var(group, "indeps.x", **var)
 
     noise = prob.model.add_subsystem("noise", NoiseComponent())
     noise.add_objective("y")
 
-    recorder = om.SqliteRecorder(recording_path)
-    prob.driver = Nsga3Driver(
-        generation_count=100, reference_partitions=2, random_seed=0
+    recorder = DatasetRecorder()
+    prob.driver = Nsga2Driver(
+        generation_count=100, random_seed=0, verbose=False,
+        # Cached iterations are not recorded
+        use_cache=False,
     )
-    prob.model.add_recorder(recorder)
+    prob.driver.add_recorder(recorder)
 
     try:
         prob.setup()
@@ -121,7 +125,7 @@ def test_variable_mixing(recording_path, variables):
     finally:
         prob.cleanup()
 
-    cases = case_dataset(om.CaseReader(recording_path))
+    cases = recorder.assemble_dataset(prob.driver)
 
     expected_value_coverage = 0.66
 

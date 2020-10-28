@@ -1,4 +1,5 @@
 import random
+from copy import deepcopy
 from itertools import chain
 
 import numpy as np
@@ -20,6 +21,10 @@ from .ga_utils import (
 )
 
 
+def default_nsga2_population_size(driver):
+    return driver.individual_size * driver.num_objectives
+
+
 class GenericNsgaDriver(Driver):
     def _declare_options(self):
         self.supports["integer_design_vars"] = True
@@ -28,11 +33,12 @@ class GenericNsgaDriver(Driver):
         self.supports["multiple_objectives"] = True
 
         self.options.declare("generation_count", default=100)
-        self.options.declare("population_size", default=None)
+        self.options.declare("min_population_size", default=None)
         self.options.declare("crossover_prob", default=None)
         self.options.declare("mutation_prob", default=None)
         self.options.declare("random_seed", default=None)
         self.options.declare("verbose", default=False, types=bool)
+        self.options.declare("use_cache", default=True, types=bool)
 
     def _setup_driver(self, problem):
         super()._setup_driver(problem)
@@ -63,6 +69,9 @@ class GenericNsgaDriver(Driver):
 
         self.individual_size = len(individual_types)
 
+        # This is up to the specific implementations to decide
+        self.population_size = None
+
         mate_indpb = 0.9
         mutate_indpb = 1.0 / self.individual_size
 
@@ -81,13 +90,15 @@ class GenericNsgaDriver(Driver):
             design_var_meta=design_var_meta,
             discrete_value_mappings=discrete_value_mappings,
         )
-        toolbox.register("evaluate", self.evaluate_individual)
+        if self.options["use_cache"]:
+            toolbox.register("evaluate", self.evaluate_individual_cached)
+        else:
+            toolbox.register("evaluate", self.evaluate_individual)
         toolbox.register(
             "mate",
             mate_disassembled,
             individual_types=individual_types,
             individual_bounds=individual_bounds,
-            int_indpb=mate_indpb,
             ord_indpb=mate_indpb,
             nom_indpb=mate_indpb,
         )
@@ -103,7 +114,16 @@ class GenericNsgaDriver(Driver):
         )
         self.toolbox = toolbox
 
-    def _evaluate_individual(self, individual):
+        self.evaluation_metadata = {"generation": 0}
+
+    def _get_recorder_metadata(self, case_name):
+        metadata = super()._get_recorder_metadata(case_name)
+        metadata.update(self.evaluation_metadata)
+        return metadata
+
+    def evaluate_individual(self, individual):
+        self.evaluation_metadata.update({"generation": individual.generation})
+
         for (name, value) in self.toolbox.ind_to_dvs(individual).items():
             self.set_design_var(name, value)
 
@@ -124,14 +144,15 @@ class GenericNsgaDriver(Driver):
             ),
         )
 
-    def evaluate_individual(self, individual):
+    def evaluate_individual_cached(self, individual):
+        # FIXME: cached evaluations are not recorded
         key = tuple(individual)
 
         if key in self.cache:
             return self.cache[key]
         else:
-            ret = self._evaluate_individual(individual)
-            self.cache[key] = ret
+            ret = self.evaluate_individual(individual)
+            self.cache[key] = deepcopy(ret)
             return ret
 
     def run(self):
@@ -140,11 +161,11 @@ class GenericNsgaDriver(Driver):
         random.seed(self.options["random_seed"])
         np.random.seed(self.options["random_seed"])
 
-        start_population = self.toolbox.population(self.options["population_size"])
+        start_population = self.toolbox.population(self.population_size)
         population, logbook = nsga_main(
             population=start_population,
             toolbox=self.toolbox,
-            mu=self.options["population_size"],
+            mu=self.population_size,
             ngen=self.options["generation_count"],
             verbose=self.options["verbose"],
         )
@@ -167,12 +188,14 @@ class GenericNsgaDriver(Driver):
         problem = self._problem()
 
         # if the value is not local, don't set the value
-        if (name in self._remote_dvs and
-                problem.model._owning_rank[name] != problem.comm.rank):
+        if (
+            name in self._remote_dvs
+            and problem.model._owning_rank[name] != problem.comm.rank
+        ):
             return
 
         meta = self._designvars[name]
-        indices = meta['indices']
+        indices = meta["indices"]
         if indices is None:
             indices = slice(None)
 
@@ -185,11 +208,11 @@ class GenericNsgaDriver(Driver):
 
             # Undo driver scaling when setting design var values into model.
             if self._has_scaling:
-                scaler = meta['scaler']
+                scaler = meta["scaler"]
                 if scaler is not None:
                     desvar[indices] *= 1.0 / scaler
 
-                adder = meta['adder']
+                adder = meta["adder"]
                 if adder is not None:
                     desvar[indices] -= adder
 
@@ -209,14 +232,17 @@ class Nsga2Driver(GenericNsgaDriver):
             mutpb=self.options["mutation_prob"] or 1.0,
         )
 
-        pop_size = self.options["population_size"]
-        if not pop_size:
-            pop_size = self.individual_size * self.num_objectives
+        min_pop_size_opt = self.options["min_population_size"]
+        if not min_pop_size_opt:
+            min_pop_size_opt = default_nsga2_population_size
+
+        try:
+            min_population_size = min_pop_size_opt(self)
+        except TypeError:
+            min_population_size = min_pop_size_opt
 
         # selTournamentDCD has a strict requirement on pop_size % 4 == 0
-        pop_size = 4 * (pop_size // 4 + 1)
-
-        self.options["population_size"] = pop_size
+        self.population_size = 4 * (min_population_size // 4 + 1)
 
 
 class Nsga3Driver(GenericNsgaDriver):
@@ -249,10 +275,15 @@ class Nsga3Driver(GenericNsgaDriver):
         )
         self.toolbox.register("select", nsga3_select)
 
-        if not self.options["population_size"]:
-            num_ref_points = len(ref_points)
-            # The population size should be the smallest multiple of 4, greater than num_ref_points
-            self.options["population_size"] = 4 * (num_ref_points // 4 + 1)
+        min_population_size = self.options["min_population_size"]
+
+        if not min_population_size:
+            min_population_size = len(ref_points)
+
+        # The population size should be the smallest multiple of 4, greater than
+        # min_population_size (and min_population_size should ideally be the
+        # number of reference points)
+        self.population_size = 4 * (min_population_size // 4 + 1)
 
 
 def nsga2_vary(population, toolbox, cxpb, mutpb):
@@ -311,6 +342,12 @@ def nsga3_vary(population, toolbox, cxpb, mutpb):
     return algorithms.varAnd(selected, toolbox, cxpb, mutpb)
 
 
+def prep_ind(ind, gen):
+    ind.generation = gen
+
+    return ind
+
+
 def nsga_main(population, toolbox, mu, ngen, halloffame=None, verbose=__debug__):
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("mean", np.mean, axis=0)
@@ -322,7 +359,7 @@ def nsga_main(population, toolbox, mu, ngen, halloffame=None, verbose=__debug__)
     logbook.header = ("gen", "nevals") + tuple(stats.fields)
 
     # Evaluate the individuals with an invalid fitness
-    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    invalid_ind = [prep_ind(ind, 0) for ind in population if not ind.fitness.valid]
     fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
     for ind, fit in zip(invalid_ind, fitnesses):
         ind.fitness.values = fit
@@ -345,7 +382,7 @@ def nsga_main(population, toolbox, mu, ngen, halloffame=None, verbose=__debug__)
         offspring = toolbox.vary(population)
 
         # Evaluate the individuals with an invalid fitness
-        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        invalid_ind = [prep_ind(ind, gen) for ind in offspring if not ind.fitness.valid]
         fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
         for ind, fit in zip(invalid_ind, fitnesses):
             ind.fitness.values = fit
